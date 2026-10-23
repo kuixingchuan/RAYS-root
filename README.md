@@ -1,3 +1,13 @@
+# RAYS-root
+
+RAYS 的账号管理与运维平台，基于 Mayfly-Go 改造。
+
+- 管理首页：账号管理、会话撤销、操作审计、运行概览与数据维护。
+- 配套 RAYS 后端补丁与配置说明：[integrations/rays](integrations/rays/README.md)。
+- 个人图库保持设备内存储，不包含公共数据管理。
+
+以下保留上游项目说明与来源。
+
 # 🌈Dromara mayfly-go
 
 <p align="center">

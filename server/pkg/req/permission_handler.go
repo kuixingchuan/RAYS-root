@@ -53,7 +53,7 @@ func PermissionHandler(rc *Ctx) error {
 	if tokenStr == "" {
 		return errorx.ErrPermission
 	}
-	userId, userName, err := ParseToken(tokenStr)
+	userId, userName, err := ParseAccessToken(tokenStr)
 	if err != nil || userId == 0 {
 		return errorx.ErrInvalidToken
 	}

@@ -129,9 +129,9 @@ export const useThemeConfig = defineStore('themeConfig', {
             /* 全局网站标题 / 副标题
             ------------------------------- */
             // 网站主标题（菜单导航、浏览器当前网页标题）
-            globalTitle: 'mayfly',
+            globalTitle: 'RAYS 管理平台',
             // 网站副标题（登录页顶部文字）
-            globalViceTitle: 'mayfly-go',
+            globalViceTitle: 'RAYS 管理平台',
             appSlogan: 'common.appSlogan',
             // 网站logo icon, base64编码内容
             logoIcon: logoIcon,
@@ -166,10 +166,10 @@ export const useThemeConfig = defineStore('themeConfig', {
             // 根据后台系统配置初始化
             getSysStyleConfig().then((res) => {
                 if (res?.title) {
-                    this.themeConfig.globalTitle = res.title;
+                    this.themeConfig.globalTitle = ['mayfly', 'mayfly-go'].includes(res.title) ? 'RAYS 管理平台' : res.title;
                 }
                 if (res?.viceTitle) {
-                    this.themeConfig.globalViceTitle = res.viceTitle;
+                    this.themeConfig.globalViceTitle = ['mayfly', 'mayfly-go'].includes(res.viceTitle) ? 'RAYS 管理平台' : res.viceTitle;
                 }
                 if (res?.logoIcon) {
                     this.themeConfig.logoIcon = res.logoIcon;

@@ -24,3 +24,6 @@ server/docs/docker-compose
 server/config.yml
 server/ip2region.xdb
 mayfly-go.log
+
+# Track dependency checksums for reproducible builds
+!server/go.sum

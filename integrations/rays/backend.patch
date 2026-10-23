@@ -1,0 +1,546 @@
+--- a/server/src/main/java/com/rays/api/accountadmin/InvitedAccountController.java
++++ b/server/src/main/java/com/rays/api/accountadmin/InvitedAccountController.java
+@@ -80,6 +80,14 @@
+                 .body(responses.success(service.create(request)));
+     }
+ 
++    @org.springframework.web.bind.annotation.PatchMapping(path = "/{userId}", consumes = MediaType.APPLICATION_JSON_VALUE)
++    public ResponseEntity<ApiResponse<InvitedAccountView>> update(
++            HttpServletRequest servletRequest, @PathVariable UUID userId,
++            @Valid @RequestBody UpdateInvitedAccountRequest request) {
++        accessGuard.requireLocal(servletRequest);
++        return noStore(responses.success(service.update(userId, request)));
++    }
++
+     @DeleteMapping("/{userId}")
+     public ResponseEntity<Void> delete(
+             HttpServletRequest servletRequest,
+--- a/server/src/main/java/com/rays/api/accountadmin/InvitedAccountRepository.java
++++ b/server/src/main/java/com/rays/api/accountadmin/InvitedAccountRepository.java
+@@ -119,6 +119,26 @@
+                 .orElse(null);
+     }
+ 
++    boolean update(UUID userId, UpdateInvitedAccountRequest request) {
++        return jdbcClient.sql("""
++                UPDATE rays.app_user
++                SET display_name = :name, locale = :locale, status = :status,
++                    updated_at = now(), version = version + 1
++                WHERE id = :id AND status <> 'DELETED'
++                """).param("name", request.displayName().trim())
++                .param("locale", request.locale())
++                .param("status", request.disabled() ? "DISABLED" : "ACTIVE")
++                .param("id", userId).update() == 1;
++    }
++
++    void revokeSessions(UUID userId, Instant now) {
++        jdbcClient.sql("""
++                UPDATE rays.auth_session SET status = 'REVOKED', revoked_at = :now,
++                    revocation_reason = 'ACCOUNT_DISABLED'
++                WHERE user_id = :id AND status IN ('ACTIVE','ROTATED')
++                """).param("id", userId).param("now", Timestamp.from(now)).update();
++    }
++
+     boolean logicallyDelete(UUID userId, Instant now) {
+         int updated = jdbcClient.sql("""
+                 UPDATE rays.app_user
+@@ -139,7 +159,7 @@
+                 UPDATE rays.auth_session
+                 SET status = 'REVOKED', revoked_at = :now,
+                     revocation_reason = 'ACCOUNT_DELETED'
+-                WHERE user_id = :userId AND status = 'ACTIVE'
++                WHERE user_id = :userId AND status IN ('ACTIVE','ROTATED')
+                 """)
+                 .param("userId", userId)
+                 .param("now", Timestamp.from(now))
+@@ -149,6 +169,7 @@
+ 
+     private static String statusExpression() {
+         return "CASE WHEN app_user.status = 'DELETED' THEN 'DELETED' "
++                + "WHEN app_user.status = 'DISABLED' THEN 'DISABLED' "
+                 + "WHEN identity.verified_at IS NULL THEN 'INVITED' ELSE 'ACTIVE' END";
+     }
+ 
+@@ -158,6 +179,7 @@
+         String accountStatus = resultSet.getString("account_status");
+         InvitedAccountStatus status = "DELETED".equals(accountStatus)
+                 ? InvitedAccountStatus.DELETED
++                : "DISABLED".equals(accountStatus) ? InvitedAccountStatus.DISABLED
+                 : verifiedAt == null ? InvitedAccountStatus.INVITED : InvitedAccountStatus.ACTIVE;
+         return new InvitedAccountView(
+                 resultSet.getObject("id", UUID.class),
+--- a/server/src/main/java/com/rays/api/accountadmin/InvitedAccountService.java
++++ b/server/src/main/java/com/rays/api/accountadmin/InvitedAccountService.java
+@@ -75,6 +75,16 @@
+         }
+     }
+ 
++    public InvitedAccountView update(UUID userId, UpdateInvitedAccountRequest request) {
++        return transactions.execute(status -> {
++            if (!repository.update(userId, request)) {
++                throw new ApiException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "账户不存在或已经删除");
++            }
++            if (request.disabled()) repository.revokeSessions(userId, Instant.now(clock));
++            return repository.find(userId);
++        });
++    }
++
+     public void delete(UUID userId) {
+         Boolean deleted = transactions.execute(status ->
+                 repository.logicallyDelete(userId, Instant.now(clock))
+--- a/server/src/main/java/com/rays/api/accountadmin/InvitedAccountStatus.java
++++ b/server/src/main/java/com/rays/api/accountadmin/InvitedAccountStatus.java
+@@ -16,5 +16,6 @@
+ public enum InvitedAccountStatus {
+     INVITED,
+     ACTIVE,
++    DISABLED,
+     DELETED
+ }
+--- a/server/src/main/java/com/rays/api/auth/AuthSecurityConfiguration.java
++++ b/server/src/main/java/com/rays/api/auth/AuthSecurityConfiguration.java
+@@ -66,7 +66,7 @@
+     }
+ 
+     @Bean
+-    NimbusJwtDecoder jwtDecoder(TokenDigests digests, AuthProperties properties) {
++    NimbusJwtDecoder jwtDecoder(TokenDigests digests, AuthProperties properties, SessionAccessValidator sessions) {
+         SecretKey key = new SecretKeySpec(digests.signingSecret(), "HmacSHA256");
+         NimbusJwtDecoder decoder = NimbusJwtDecoder.withSecretKey(key)
+                 .macAlgorithm(MacAlgorithm.HS256)
+@@ -80,7 +80,7 @@
+                 new JwtTimestampValidator(Duration.ofSeconds(60)),
+                 new JwtIssuerValidator(properties.issuer()),
+                 new JwtAudienceValidator(properties.audience()),
+-                tokenType
++                tokenType, sessions
+         ));
+         return decoder;
+     }
+@@ -101,6 +101,7 @@
+                                 "/api/v1/system/**",
+                                 "/api/v1/public/**",
+                                 "/api/v1/local-admin/**",
++                                "/api/v1/admin/**",
+                                 "/api/v1/auth/refresh",
+                                 "/api/v1/auth/logout",
+                                 "/api/v1/auth/web/refresh",
+--- a/server/src/main/java/com/rays/api/auth/AuthSessionRepository.java
++++ b/server/src/main/java/com/rays/api/auth/AuthSessionRepository.java
+@@ -98,7 +98,7 @@
+         jdbcClient.sql("""
+                         UPDATE rays.auth_session
+                         SET status = :status, revoked_at = :now, revocation_reason = :reason
+-                        WHERE family_id = :familyId AND status = 'ACTIVE'
++                        WHERE family_id = :familyId AND status IN ('ACTIVE','ROTATED')
+                         """)
+                 .param("status", status)
+                 .param("now", Timestamp.from(now))
+--- a/server/src/main/resources/application-test.yml
++++ b/server/src/main/resources/application-test.yml
+@@ -42,6 +42,7 @@
+     attribution: RAYS test weather
+     attribution-url: https://example.invalid/weather
+   auth:
++    validate-session: false
+     jwt-secret-base64: cmF5cy10ZXN0LW9ubHktand0LXNlY3JldC0zMi1ieXRlcw==
+     email:
+       delivery: in-memory
+--- a/server/src/main/resources/application.yml
++++ b/server/src/main/resources/application.yml
+@@ -65,6 +65,8 @@
+     com.rays.api: INFO
+ 
+ rays:
++  admin:
++    bridge-token: ${RAYS_ADMIN_BRIDGE_TOKEN:}
+   ai:
+     credentials:
+       master-key-base64: ${RAYS_AI_CREDENTIAL_MASTER_KEY_BASE64:}
+--- a/server/src/test/java/com/rays/api/DatabaseMigrationIntegrationTest.java
++++ b/server/src/test/java/com/rays/api/DatabaseMigrationIntegrationTest.java
+@@ -33,6 +33,7 @@
+ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+@@ -80,6 +81,7 @@
+ 
+     @DynamicPropertySource
+     static void databaseProperties(DynamicPropertyRegistry registry) {
++        registry.add("rays.admin.bridge-token", () -> "database-test-admin-secret-32-characters");
+         registry.add("spring.datasource.url", POSTGIS::getJdbcUrl);
+         registry.add("spring.datasource.username", POSTGIS::getUsername);
+         registry.add("spring.datasource.password", POSTGIS::getPassword);
+@@ -159,7 +161,7 @@
+ 
+         assertThat(postgisVersion).startsWith("3.");
+         assertThat(schemaExists).isTrue();
+-        assertThat(successfulMigrations).isEqualTo(12L);
++        assertThat(successfulMigrations).isEqualTo(13L);
+     }
+ 
+     @Test
+@@ -172,7 +174,7 @@
+                         """)
+                 .query(UUID.class)
+                 .single();
+-        String token = jwtTokenService.issue(userId, UUID.randomUUID()).value();
++        String token = authSessionService.issue(userId, new AuthSessionService.ClientContext("fixture", "127.0.0.1")).accessToken();
+         String firstKey = "sk-valid-m27a-first-12345678";
+         String secondKey = "sk-valid-m27a-second-87654321";
+         try {
+@@ -290,7 +292,7 @@
+     @Test
+     void aiInferencePersistsRouteUsageCacheAndAppendOnlyAudit() throws Exception {
+         UUID userId = UUID.fromString("10000000-0000-4000-8000-000000000001");
+-        String token = jwtTokenService.issue(userId, UUID.randomUUID()).value();
++        String token = authSessionService.issue(userId, new AuthSessionService.ClientContext("fixture", "127.0.0.1")).accessToken();
+         String request = """
+                 {
+                   "taskType": "PHOTO_ORGANIZATION",
+@@ -378,7 +380,7 @@
+                     .param("otherUserId", otherUserId)
+                     .update();
+ 
+-            String token = jwtTokenService.issue(userId, UUID.randomUUID()).value();
++            String token = authSessionService.issue(userId, new AuthSessionService.ClientContext("fixture", "127.0.0.1")).accessToken();
+             mockMvc.perform(get("/api/v1/ai/usage")
+                             .queryParam("days", "30")
+                             .header("Authorization", "Bearer " + token))
+@@ -818,8 +820,11 @@
+                 new AuthSessionService.ClientContext("logout-test", "192.0.2.11")
+         );
+ 
+-        authSessionService.logout(issued.refreshToken());
+-        authSessionService.logout(issued.refreshToken());
++        var rotated = authSessionService.refresh(issued.refreshToken(), new AuthSessionService.ClientContext("logout-test", "192.0.2.11"));
++        authSessionService.logout(rotated.refreshToken());
++        authSessionService.logout(rotated.refreshToken());
++        assertThatThrownBy(() -> jwtDecoder.decode(issued.accessToken())).isInstanceOf(org.springframework.security.oauth2.jwt.JwtException.class);
++        assertThatThrownBy(() -> jwtDecoder.decode(rotated.accessToken())).isInstanceOf(org.springframework.security.oauth2.jwt.JwtException.class);
+ 
+         assertThatThrownBy(() -> authSessionService.refresh(
+                 issued.refreshToken(),
+@@ -1443,6 +1448,41 @@
+     }
+ 
+     @Test
++    void adminLifecycleAuditsAndInvalidatesAccessTokens() throws Exception {
++        String secret="database-test-admin-secret-32-characters";
++        mockMvc.perform(get("/api/v1/admin/overview").header("X-RAYS-Admin-Token",secret)
++            .header("X-RAYS-Admin-Actor","mayfly:1")).andExpect(status().isOk())
++            .andExpect(jsonPath("$.data.api_status").value("RUNNING"));
++        mockMvc.perform(get("/api/v1/admin/accounts")).andExpect(status().isForbidden());
++        mockMvc.perform(get("/api/v1/admin/accounts").header("X-RAYS-Admin-Token", "incorrect")
++            .header("X-RAYS-Admin-Actor", "mayfly:1")).andExpect(status().isForbidden());
++        String response=mockMvc.perform(post("/api/v1/admin/accounts")
++            .header("X-RAYS-Admin-Token",secret).header("X-RAYS-Admin-Actor","mayfly:1")
++            .contentType("application/json").content("""
++                {"displayName":"管理测试","provider":"EMAIL","subject":"admin-%s@example.com","locale":"zh-CN"}
++                """.formatted(UUID.randomUUID())))
++            .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
++        UUID id=UUID.fromString(objectMapper.readTree(response).path("data").path("id").asText());
++        String token=authSessionService.issue(id,new AuthSessionService.ClientContext("admin-test","127.0.0.1")).accessToken();
++        mockMvc.perform(get("/api/v1/auth/me").header("Authorization","Bearer "+token)).andExpect(status().isOk());
++        mockMvc.perform(patch("/api/v1/admin/accounts/{id}",id)
++            .header("X-RAYS-Admin-Token",secret).header("X-RAYS-Admin-Actor","mayfly:1")
++            .contentType("application/json").content("{\"displayName\":\"已修改\",\"locale\":\"zh-CN\",\"disabled\":true}"))
++            .andExpect(status().isOk()).andExpect(jsonPath("$.data.status").value("DISABLED"));
++        mockMvc.perform(get("/api/v1/auth/me").header("Authorization","Bearer "+token)).andExpect(status().isUnauthorized());
++        mockMvc.perform(patch("/api/v1/admin/accounts/{id}",id)
++            .header("X-RAYS-Admin-Token",secret).header("X-RAYS-Admin-Actor","mayfly:1")
++            .contentType("application/json").content("{\"displayName\":\"已解禁\",\"locale\":\"zh-CN\",\"disabled\":false}"))
++            .andExpect(status().isOk());
++        mockMvc.perform(get("/api/v1/auth/me").header("Authorization","Bearer "+token)).andExpect(status().isUnauthorized());
++        mockMvc.perform(post("/api/v1/admin/maintenance/expire-sessions")
++            .header("X-RAYS-Admin-Token",secret).header("X-RAYS-Admin-Actor","mayfly:1")).andExpect(status().isOk());
++        mockMvc.perform(delete("/api/v1/admin/accounts/{id}",id)
++            .header("X-RAYS-Admin-Token",secret).header("X-RAYS-Admin-Actor","mayfly:1")).andExpect(status().isOk());
++        assertThat(jdbcClient.sql("SELECT count(*) FROM rays.admin_audit WHERE target=:id").param("id",id.toString()).query(Long.class).single()).isEqualTo(4L);
++    }
++
++    @Test
+     void localAdminCreatesAndDeletesInvitedAccount() throws Exception {
+         String email = "invite-" + UUID.randomUUID() + "@example.com";
+         String response = mockMvc.perform(post("/api/v1/local-admin/accounts")
+--- /dev/null
++++ b/server/src/main/java/com/rays/api/accountadmin/AdminBridgeGuard.java
+@@ -0,0 +1,38 @@
++// RAYS_NOVICE_GUIDE_BEGIN
++// 新手阅读说明：server/src/main/java/com/rays/api/accountadmin/AdminBridgeGuard.java
++// 所属模块：邀约制账户管理；所在层：Spring Boot 服务端。
++// 核心职责：只承担文件名所表示的规则或能力；调用关系请结合下方公开类型阅读。
++// 关键入口：AdminBridgeGuard。
++// 输入与输出：输入是查询、命令或外部响应；输出是领域对象、持久化结果或明确异常。
++// 状态与副作用：可能访问 SQLite、PostgreSQL、文件或网络；调用方必须等待完成再使用结果。
++// 失败处理：在本层补充上下文并保持原始原因，让上层能区分无数据、无权限和系统错误。
++// 平台差异：没有客户端平台分支；行为应在本地开发、CI 与生产配置之间保持一致。
++// 推荐顺序：先看接口或公开方法，再看异常转换、持久化和返回值。
++// 修改提醒：先确认输入、输出和失败状态，再改实现；不要在本层偷偷承担其他层的职责。
++// RAYS_NOVICE_GUIDE_END
++
++package com.rays.api.accountadmin;
++
++import com.rays.api.common.error.ApiException;
++import jakarta.servlet.http.HttpServletRequest;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.http.HttpStatus;
++import org.springframework.stereotype.Component;
++
++/** 仅供已认证的管理服务调用。凭据不得下发浏览器。默认禁用。 */
++@Component
++public final class AdminBridgeGuard {
++    private final String secret;
++    public AdminBridgeGuard(@Value("${rays.admin.bridge-token:}") String secret) { this.secret=secret; }
++    public String require(HttpServletRequest request) {
++        String supplied=request.getHeader("X-RAYS-Admin-Token");
++        String actor=request.getHeader("X-RAYS-Admin-Actor");
++        if(secret.length()<32 || supplied==null || !MessageDigest.isEqual(secret.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8)))
++            throw new ApiException(HttpStatus.FORBIDDEN,"ADMIN_ACCESS_REQUIRED","管理服务凭据无效");
++        if(actor==null || !actor.matches("[A-Za-z0-9_.:@-]{1,120}"))
++            throw new ApiException(HttpStatus.BAD_REQUEST,"ADMIN_ACTOR_REQUIRED","缺少合法操作者身份");
++        return actor;
++    }
++}
+--- /dev/null
++++ b/server/src/main/java/com/rays/api/accountadmin/AdminController.java
+@@ -0,0 +1,100 @@
++// RAYS_NOVICE_GUIDE_BEGIN
++// 新手阅读说明：server/src/main/java/com/rays/api/accountadmin/AdminController.java
++// 所属模块：邀约制账户管理；所在层：Spring Boot 服务端。
++// 核心职责：接收外部操作、校验流程顺序，并调用服务或仓储完成用例。
++// 关键入口：AdminController。
++// 输入与输出：输入是查询、命令或外部响应；输出是领域对象、持久化结果或明确异常。
++// 状态与副作用：可能访问 SQLite、PostgreSQL、文件或网络；调用方必须等待完成再使用结果。
++// 失败处理：在本层补充上下文并保持原始原因，让上层能区分无数据、无权限和系统错误。
++// 平台差异：没有客户端平台分支；行为应在本地开发、CI 与生产配置之间保持一致。
++// 推荐顺序：先看接口或公开方法，再看异常转换、持久化和返回值。
++// 修改提醒：先确认输入、输出和失败状态，再改实现；不要在本层偷偷承担其他层的职责。
++// RAYS_NOVICE_GUIDE_END
++
++package com.rays.api.accountadmin;
++
++import com.rays.api.common.api.*;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.*;
++import java.util.*;
++import org.springframework.jdbc.core.simple.JdbcClient;
++import org.springframework.transaction.support.TransactionTemplate;
++import org.springframework.validation.annotation.Validated;
++import org.springframework.web.bind.annotation.*;
++import org.springframework.http.*;
++
++/** 独立管理接口：业务变更与审计同一事务提交，不读取个人照片。 */
++@RestController @Validated
++@RequestMapping("/api/v1/admin")
++public class AdminController {
++    private final AdminBridgeGuard guard;
++    private final InvitedAccountService accounts;
++    private final JdbcClient jdbc;
++    private final TransactionTemplate transactions;
++    private final ApiResponses responses;
++    private final com.rays.api.auth.AuthProperties auth;
++    public AdminController(AdminBridgeGuard guard, InvitedAccountService accounts, JdbcClient jdbc,
++            TransactionTemplate transactions, ApiResponses responses, com.rays.api.auth.AuthProperties auth) {
++        this.guard=guard; this.accounts=accounts; this.jdbc=jdbc; this.transactions=transactions; this.responses=responses; this.auth=auth;
++    }
++    private void audit(String actor,String action,String target) {
++        jdbc.sql("INSERT INTO rays.admin_audit(actor,action,target) VALUES(:a,:b,:c)")
++            .param("a",actor).param("b",action).param("c",target).update();
++    }
++    private <T> ResponseEntity<ApiResponse<T>> ok(T value) {
++        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(responses.success(value));
++    }
++    @GetMapping("/accounts")
++    public ResponseEntity<?> list(HttpServletRequest req,@RequestParam(required=false) @Size(max=160) String q,
++            @RequestParam(required=false) InvitedAccountStatus status) {
++        guard.require(req); return ok(accounts.list(q,status));
++    }
++    @PostMapping("/accounts")
++    public ResponseEntity<?> create(HttpServletRequest req,@Valid @RequestBody CreateInvitedAccountRequest body) {
++        String actor=guard.require(req);
++        return ok(transactions.execute(tx->{var result=accounts.create(body);audit(actor,"ACCOUNT_CREATE",result.id().toString());return result;}));
++    }
++    @PatchMapping("/accounts/{id}")
++    public ResponseEntity<?> update(HttpServletRequest req,@PathVariable UUID id,@Valid @RequestBody UpdateInvitedAccountRequest body) {
++        String actor=guard.require(req);
++        return ok(transactions.execute(tx->{var result=accounts.update(id,body);audit(actor,body.disabled()?"ACCOUNT_DISABLE":"ACCOUNT_UPDATE",id.toString());return result;}));
++    }
++    @DeleteMapping("/accounts/{id}")
++    public ResponseEntity<?> delete(HttpServletRequest req,@PathVariable UUID id) {
++        String actor=guard.require(req);
++        transactions.executeWithoutResult(tx->{accounts.delete(id);audit(actor,"ACCOUNT_DELETE",id.toString());});
++        return ok(Map.of("deleted",true));
++    }
++    @PostMapping("/accounts/{id}/revoke-sessions")
++    public ResponseEntity<?> revoke(HttpServletRequest req,@PathVariable UUID id) {
++        String actor=guard.require(req);
++        return ok(transactions.execute(tx->{int count=jdbc.sql("UPDATE rays.auth_session SET status='REVOKED',revoked_at=now(),revocation_reason='ADMIN_REVOKED' WHERE user_id=:id AND status IN ('ACTIVE','ROTATED')").param("id",id).update();audit(actor,"SESSION_REVOKE",id.toString());return Map.of("revoked",count);}));
++    }
++    @GetMapping("/audit")
++    public ResponseEntity<?> auditList(HttpServletRequest req,@RequestParam(defaultValue="100") @Min(1) @Max(500) int limit) {
++        guard.require(req); return ok(jdbc.sql("SELECT id,actor,action,target,created_at FROM rays.admin_audit ORDER BY id DESC LIMIT :n").param("n",limit).query().listOfRows());
++    }
++    @GetMapping("/overview")
++    public ResponseEntity<?> overview(HttpServletRequest req) {
++        guard.require(req);
++        var state = new java.util.LinkedHashMap<String,Object>(jdbc.sql("""
++            SELECT (SELECT count(*) FROM rays.app_user WHERE status<>'DELETED') AS accounts,
++              (SELECT count(*) FROM rays.app_user WHERE status='DISABLED') AS disabled,
++              (SELECT count(*) FROM rays.auth_session WHERE status='ACTIVE' AND expires_at>now()) AS sessions,
++              (SELECT count(*) FROM rays.admin_audit) AS audit_events,
++              pg_database_size(current_database()) AS database_bytes, now() AS checked_at
++            """).query().singleRow());
++        state.put("api_status", "RUNNING");
++        state.put("uptime_seconds", java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime()/1000);
++        state.put("heap_used_bytes", Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());
++        state.put("login_rate_limit", auth.loginRateLimit());
++        state.put("rate_limit_window_seconds", auth.rateLimitWindow().toSeconds());
++        return ok(state);
++    }
++    @PostMapping("/maintenance/expire-sessions")
++    public ResponseEntity<?> expire(HttpServletRequest req) {
++        String actor=guard.require(req);
++        return ok(transactions.execute(tx->{int count=jdbc.sql("UPDATE rays.auth_session SET status='EXPIRED' WHERE status IN ('ACTIVE','ROTATED') AND expires_at<=now()").update();audit(actor,"SESSION_EXPIRE",Integer.toString(count));return Map.of("expired",count);}));
++    }
++}
+--- /dev/null
++++ b/server/src/main/java/com/rays/api/accountadmin/UpdateInvitedAccountRequest.java
+@@ -0,0 +1,25 @@
++// RAYS_NOVICE_GUIDE_BEGIN
++// 新手阅读说明：server/src/main/java/com/rays/api/accountadmin/UpdateInvitedAccountRequest.java
++// 所属模块：邀约制账户管理；所在层：Spring Boot 服务端。
++// 核心职责：保存跨层传递的数据，并在构造时维护字段约束。
++// 关键入口：UpdateInvitedAccountRequest。
++// 输入与输出：输入是查询、命令或外部响应；输出是领域对象、持久化结果或明确异常。
++// 状态与副作用：可能访问 SQLite、PostgreSQL、文件或网络；调用方必须等待完成再使用结果。
++// 失败处理：在本层补充上下文并保持原始原因，让上层能区分无数据、无权限和系统错误。
++// 平台差异：没有客户端平台分支；行为应在本地开发、CI 与生产配置之间保持一致。
++// 推荐顺序：先看接口或公开方法，再看异常转换、持久化和返回值。
++// 修改提醒：先确认输入、输出和失败状态，再改实现；不要在本层偷偷承担其他层的职责。
++// RAYS_NOVICE_GUIDE_END
++
++package com.rays.api.accountadmin;
++
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Pattern;
++import jakarta.validation.constraints.Size;
++
++/** 修改账号资料和启停状态；不允许借此更改登录身份或删除账号。 */
++public record UpdateInvitedAccountRequest(
++    @NotBlank @Size(max = 120) String displayName,
++    @NotBlank @Pattern(regexp = "^[a-z]{2}-[A-Z]{2}$") String locale,
++    boolean disabled
++) {}
+--- /dev/null
++++ b/server/src/main/java/com/rays/api/auth/SessionAccessValidator.java
+@@ -0,0 +1,44 @@
++// RAYS_NOVICE_GUIDE_BEGIN
++// 新手阅读说明：server/src/main/java/com/rays/api/auth/SessionAccessValidator.java
++// 所属模块：认证、会话与登录渠道；所在层：Spring Boot 服务端。
++// 核心职责：只承担文件名所表示的规则或能力；调用关系请结合下方公开类型阅读。
++// 关键入口：SessionAccessValidator。
++// 输入与输出：输入是查询、命令或外部响应；输出是领域对象、持久化结果或明确异常。
++// 状态与副作用：可能访问 SQLite、PostgreSQL、文件或网络；调用方必须等待完成再使用结果。
++// 失败处理：在本层补充上下文并保持原始原因，让上层能区分无数据、无权限和系统错误。
++// 平台差异：没有客户端平台分支；行为应在本地开发、CI 与生产配置之间保持一致。
++// 推荐顺序：先看接口或公开方法，再看异常转换、持久化和返回值。
++// 修改提醒：先确认输入、输出和失败状态，再改实现；不要在本层偷偷承担其他层的职责。
++// RAYS_NOVICE_GUIDE_END
++
++package com.rays.api.auth;
++
++import java.util.UUID;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.jdbc.core.simple.JdbcClient;
++import org.springframework.security.oauth2.core.*;
++import org.springframework.security.oauth2.jwt.Jwt;
++import org.springframework.stereotype.Component;
++
++/** 每次访问均检查服务端账号与会话，不缓存禁用状态。 */
++@Component
++public final class SessionAccessValidator implements OAuth2TokenValidator<Jwt> {
++    private final JdbcClient jdbc;
++    private final boolean enabled;
++    public SessionAccessValidator(JdbcClient jdbc, @Value("${rays.auth.validate-session:true}") boolean enabled) {
++        this.jdbc = jdbc; this.enabled = enabled;
++    }
++    public OAuth2TokenValidatorResult validate(Jwt jwt) {
++        if (!enabled) return OAuth2TokenValidatorResult.success();
++        try {
++            boolean active = jdbc.sql("""
++                SELECT EXISTS(SELECT 1 FROM rays.auth_session s JOIN rays.app_user u ON u.id=s.user_id
++                WHERE s.id=:sid AND u.id=:uid AND u.status='ACTIVE'
++                  AND s.status IN ('ACTIVE','ROTATED') AND s.expires_at > now())
++                """).param("sid", UUID.fromString(jwt.getClaimAsString("sid")))
++                .param("uid", UUID.fromString(jwt.getSubject())).query(Boolean.class).single();
++            if (active) return OAuth2TokenValidatorResult.success();
++        } catch (RuntimeException ignored) { /* 数据库不可用或非法声明均拒绝，不输出身份/令牌。 */ }
++        return OAuth2TokenValidatorResult.failure(new OAuth2Error("invalid_token", "Account or session is inactive", null));
++    }
++}
+--- /dev/null
++++ b/server/src/main/resources/db/migration/V12__create_admin_audit.sql
+@@ -0,0 +1,8 @@
++CREATE TABLE rays.admin_audit (
++    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
++    actor varchar(120) NOT NULL,
++    action varchar(48) NOT NULL,
++    target varchar(120),
++    created_at timestamptz NOT NULL DEFAULT now()
++);
++CREATE INDEX ix_admin_audit_created ON rays.admin_audit(created_at DESC);
+--- /dev/null
++++ b/server/src/test/java/com/rays/api/accountadmin/InvitedAccountUpdateTest.java
+@@ -0,0 +1,44 @@
++// RAYS_NOVICE_GUIDE_BEGIN
++// 新手阅读说明：server/src/test/java/com/rays/api/accountadmin/InvitedAccountUpdateTest.java
++// 所属模块：Spring Boot 自动化测试；所在层：测试层。
++// 核心职责：固定一个可观察行为，防止以后修改时悄悄破坏现有功能。
++// 关键入口：InvitedAccountUpdateTest。
++// 输入与输出：输入是固定夹具与替身；输出由断言表达，失败时直接指出被破坏的行为。
++// 状态与副作用：测试应使用隔离数据，不依赖执行顺序，也不修改用户真实资料。
++// 失败处理：失败即说明行为与预期不一致；先读第一条失败断言和它准备的数据。
++// 平台差异：没有客户端平台分支；行为应在本地开发、CI 与生产配置之间保持一致。
++// 推荐顺序：按 Arrange（准备）、Act（执行）、Assert（断言）的顺序阅读每个测试。
++// 修改提醒：先确认输入、输出和失败状态，再改实现；不要在本层偷偷承担其他层的职责。
++// RAYS_NOVICE_GUIDE_END
++
++package com.rays.api.accountadmin;
++
++import com.rays.api.auth.email.EmailCanonicalizer;
++import com.rays.api.auth.phone.PhoneCanonicalizer;
++import com.rays.api.common.error.ApiException;
++import org.junit.jupiter.api.Test;
++import org.springframework.transaction.support.TransactionTemplate;
++import java.util.UUID;
++import org.springframework.transaction.support.TransactionCallback;
++import static org.mockito.Mockito.*;
++import static org.assertj.core.api.Assertions.*;
++
++class InvitedAccountUpdateTest {
++    @Test
++    void disabledAccountRevokesSessionsAndMissingAccountDoesNot() {
++        var repository = mock(InvitedAccountRepository.class);
++        var transactions = mock(TransactionTemplate.class);
++        when(transactions.execute(any())).thenAnswer(invocation ->
++            ((TransactionCallback<?>) invocation.getArgument(0)).doInTransaction(null));
++        var service = new InvitedAccountService(repository, mock(EmailCanonicalizer.class),
++            mock(PhoneCanonicalizer.class), transactions);
++        var id = UUID.randomUUID();
++        var request = new UpdateInvitedAccountRequest("用户", "zh-CN", true);
++        when(repository.update(id, request)).thenReturn(true);
++        service.update(id, request);
++        verify(repository).revokeSessions(eq(id), any());
++        var missing = UUID.randomUUID();
++        assertThatThrownBy(() -> service.update(missing, request)).isInstanceOf(ApiException.class);
++        verify(repository, never()).revokeSessions(eq(missing), any());
++    }
++}

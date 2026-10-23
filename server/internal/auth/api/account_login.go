@@ -148,6 +148,7 @@ func (a *AccountLogin) RefreshToken(rc *req.Ctx) {
 
 func (a *AccountLogin) Logout(rc *req.Ctx) {
 	la := rc.GetLoginAccount()
+	biz.ErrIsNil(req.RevokeTokens(la.Id))
 	req.GetPermissionCodeRegistery().Remove(la.Id)
 	ws.CloseClient(ws.UserId(la.Id))
 }

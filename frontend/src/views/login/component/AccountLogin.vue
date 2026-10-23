@@ -80,7 +80,7 @@
             </el-form>
 
             <template #footer>
-                <<el-button @click="cancelChangePwd">{{ $t('common.cancel') }}</el-button>
+                <el-button @click="cancelChangePwd">{{ $t('common.cancel') }}</el-button>
                 <el-button @click="changePwd" type="primary" :loading="loading.changePwd">
                     {{ $t('common.confirm') }}
                 </el-button>
